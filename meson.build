@@ -1485,7 +1485,7 @@ if build_tests
       args: ['--', secret_collection_probe_integration_exe.full_path()],
       depends: secret_collection_probe_integration_exe,
     )
-    foreach mode : ['registration', 'discovery']
+    foreach mode : ['registration', 'discovery', 'external-watcher']
       foreach scenario : ['default', 'ayatana', 'both']
         test('tray_' + mode + '_' + scenario + '_integration',
           dbus_run_session,

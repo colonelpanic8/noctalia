@@ -737,7 +737,7 @@ void TrayService::connectToExternalWatcher() {
 
     m_watcherProxy->getPropertyAsync("RegisteredStatusNotifierItems")
         .onInterface(kWatcherInterface)
-        .uponReplyInvoke([this](std::optional<sdbus::Error> error, sdbus::Variant value) {
+        .uponReplyInvoke([this](std::optional<sdbus::Error> error, const sdbus::Variant& value) {
           if (error.has_value()) {
             kLog.debug("tray external watcher item list failed: {}", error->what());
             return;

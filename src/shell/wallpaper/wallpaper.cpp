@@ -99,6 +99,28 @@ namespace {
       params.centerX = randomFloat(0.2F, 0.8F);
       params.centerY = randomFloat(0.2F, 0.8F);
       break;
+    case WallpaperTransition::Vortex:
+      params.centerX = randomFloat(0.2F, 0.8F);
+      params.centerY = randomFloat(0.2F, 0.8F);
+      break;
+    case WallpaperTransition::Pixel:
+      params.cellSize = randomFloat(0.02F, 0.05F);
+      params.centerX = randomFloat(0.2F, 0.8F);
+      params.centerY = randomFloat(0.2F, 0.8F);
+      break;
+    case WallpaperTransition::Diamond:
+      params.cellSize = randomFloat(0.0345F, 0.069F);
+      params.centerX = randomFloat(0.2F, 0.8F);
+      params.centerY = randomFloat(0.2F, 0.8F);
+      break;
+    case WallpaperTransition::Golden:
+      params.centerX = randomFloat(0.2F, 0.8F);
+      params.centerY = randomFloat(0.2F, 0.8F);
+      params.angle = randomFloat(0.0F, 360.0F);
+      break;
+    case WallpaperTransition::Melt:
+      params.angle = randomFloat(0.0F, 360.0F);
+      break;
     case WallpaperTransition::Fade:
     default:
       break;
@@ -312,22 +334,31 @@ Wallpaper::~Wallpaper() {
   }
 }
 
-TextureHandle Wallpaper::currentTexture() const {
+const WallpaperInstance* Wallpaper::currentInstance() const {
+  const WallpaperInstance* firstAvailable = nullptr;
   for (const auto& inst : m_instances) {
-    if (const TextureHandle texture = inst->currentImage.texture(); texture.valid()) {
-      return texture;
+    const TextureHandle texture = inst->currentImage.texture();
+    if (!texture.valid() || inst->currentPath.empty()) {
+      continue;
+    }
+    if (texture.sourceWidth > texture.sourceHeight) {
+      return inst.get();
+    }
+    if (firstAvailable == nullptr) {
+      firstAvailable = inst.get();
     }
   }
-  return {};
+  return firstAvailable;
+}
+
+TextureHandle Wallpaper::currentTexture() const {
+  const WallpaperInstance* inst = currentInstance();
+  return inst != nullptr ? inst->currentImage.texture() : TextureHandle{};
 }
 
 std::string Wallpaper::currentPath() const {
-  for (const auto& inst : m_instances) {
-    if (inst->currentImage.texture().valid() && !inst->currentPath.empty()) {
-      return inst->currentPath;
-    }
-  }
-  return {};
+  const WallpaperInstance* inst = currentInstance();
+  return inst != nullptr ? inst->currentPath : std::string{};
 }
 
 bool Wallpaper::ownsSurface(wl_surface* surface) const noexcept {
@@ -386,7 +417,7 @@ bool Wallpaper::initialize(
   m_themeService = themeService;
 
   // Register reload callback unconditionally so toggling enabled in config works.
-  m_config->addReloadCallback([this]() { reload(); }, "wallpaper");
+  m_config->addReloadCallback([this] { reload(); }, "wallpaper");
   m_paletteConn = paletteChanged().connect([this] {
     for (auto& inst : m_instances) {
       updateRendererState(*inst);
@@ -576,6 +607,25 @@ void Wallpaper::onSecondTick() {
   }
   m_lastAutomationSecondStamp = secondStamp;
   runAutomation(secondStamp);
+}
+
+std::optional<std::chrono::system_clock::time_point> Wallpaper::nextAutomationDeadline() const {
+  if (m_config == nullptr || !m_config->config().wallpaper.enabled) {
+    return std::nullopt;
+  }
+  const auto& automation = m_config->config().wallpaper.automation;
+  if (!automation.enabled || m_instances.empty() || !automationAllowed()) {
+    return std::nullopt;
+  }
+
+  using namespace std::chrono;
+  // No switch yet: runAutomation() rotates on the very next tick.
+  if (m_lastAutomationSwitchSecond < 0) {
+    return system_clock::now();
+  }
+  return system_clock::time_point{
+      seconds{m_lastAutomationSwitchSecond + static_cast<std::int64_t>(automation.intervalSeconds)}
+  };
 }
 
 bool Wallpaper::isConnectorKnown(std::string_view connector) const {
@@ -776,7 +826,7 @@ void Wallpaper::syncInstances() {
 
   // Remove instances for outputs that no longer exist or are now disabled by monitor override
   std::erase_if(m_instances, [&](const auto& inst) {
-    const auto* output = [&]() -> const WaylandOutput* {
+    const auto* output = [&] -> const WaylandOutput* {
       for (const auto& out : outputs) {
         if (out.name == inst->outputName)
           return &out;
@@ -1254,7 +1304,7 @@ void Wallpaper::createInstance(const WaylandOutput& output) {
 
   instance->surface->setAnimationManager(&instance->animations);
 
-  instance->surface->setUpdateCallback([this, inst]() { updateRendererState(*inst); });
+  instance->surface->setUpdateCallback([this, inst] { updateRendererState(*inst); });
 
   if (!instance->surface->initialize(output.output)) {
     kLog.warn("failed to initialize surface for output {}", output.name);
@@ -1320,7 +1370,7 @@ void Wallpaper::loadWallpaper(WallpaperInstance& instance, const std::string& pa
     image = m_textureCache->acquire(
         SharedTextureRequest{.path = path, .coverage = textureCoverage(instance)},
         m_renderContext != nullptr ? &m_renderContext->backend() : nullptr,
-        [this, inst = &instance]() { onImageChanged(*inst); }
+        [this, inst = &instance] { onImageChanged(*inst); }
     );
   }
   if (image.empty() || image.failed()) {
@@ -1466,7 +1516,7 @@ void Wallpaper::startTransitionAnimation(
   // animations-enabled toggle (disabling animations must not skip the crossfade).
   instance.transitionAnimId = instance.animations.animateTimer(
       fromTime, toTime, durationMs, Easing::Linear, [inst](float time) { setTransitionTime(*inst, time); },
-      [this, inst]() { finishTransition(*inst); }
+      [this, inst] { finishTransition(*inst); }
   );
 
   updateRendererState(instance);

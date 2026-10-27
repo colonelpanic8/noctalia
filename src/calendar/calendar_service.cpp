@@ -30,6 +30,7 @@
 #include <sodium.h>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 
 namespace {
   constexpr Logger kLog("calendar");
@@ -116,7 +117,7 @@ struct CalendarService::VdirWorker : std::enable_shared_from_this<CalendarServic
         callback;
   };
 
-  VdirWorker() : worker([this](std::stop_token stopToken) { workerLoop(stopToken); }) {}
+  VdirWorker() : worker([this](std::stop_token stopToken) { workerLoop(std::move(stopToken)); }) {}
   ~VdirWorker() { stop(); }
 
   bool enqueue(Request request) {
@@ -137,7 +138,7 @@ struct CalendarService::VdirWorker : std::enable_shared_from_this<CalendarServic
   ) {
     const std::weak_ptr<VdirWorker> weak = weak_from_this();
     DeferredCall::callLater([weak, cb = std::move(request.callback), ok, sources = std::move(sources),
-                             watchedPaths = std::move(watchedPaths), events = std::move(events)]() mutable {
+                             watchedPaths = std::move(watchedPaths), events = std::move(events)] mutable {
       const auto state = weak.lock();
       if (!state || !state->accepting()) {
         return;
@@ -170,7 +171,7 @@ private:
       Request request;
       {
         std::unique_lock lock(mutex);
-        cv.wait(lock, [this, &stopToken]() { return stopping || stopToken.stop_requested() || !requests.empty(); });
+        cv.wait(lock, [this, &stopToken] { return stopping || stopToken.stop_requested() || !requests.empty(); });
         if (stopping || stopToken.stop_requested()) {
           return;
         }
@@ -262,8 +263,8 @@ CalendarService::~CalendarService() = default;
 
 void CalendarService::initialize() {
   m_activeConfig = m_configService.config().calendar;
-  m_configService.addReloadCallback([this]() { onConfigReload(); });
-  m_credentials.setChangeCallback([this]() {
+  m_configService.addReloadCallback([this] { onConfigReload(); });
+  m_credentials.setChangeCallback([this] {
     notifyChanged();
     if (m_credentialChangeCallback) {
       m_credentialChangeCallback();
@@ -290,11 +291,10 @@ void CalendarService::syncCachePersistence() {
       return;
     }
     m_cacheKey = std::move(*key);
-    if (!loadCache()) {
-      if (m_cachePersistenceState == CachePersistenceState::Opening) {
-        setCachePersistenceState(CachePersistenceState::BackendError, m_cacheMigrationPending);
-      }
+    if (!loadCache() && m_cachePersistenceState == CachePersistenceState::Opening) {
+      setCachePersistenceState(CachePersistenceState::BackendError, m_cacheMigrationPending);
     }
+
     return;
   }
 
@@ -368,7 +368,7 @@ calendar::CredentialMigration CalendarService::credentialMigration() {
     append("_refresh_token", calendar::CredentialKind::RefreshToken);
   }
 
-  migration.finalize = [this]() {
+  migration.finalize = [this] {
     if (!m_configService.clearStateOwner(kCredentialOwner)) {
       return false;
     }
@@ -590,7 +590,14 @@ void CalendarService::startRefresh() {
 
 void CalendarService::accountDone(const std::string& accountId, bool ok, std::vector<CalendarEvent> events) {
   if (ok) {
+    kLog.debug("calendar account {} refreshed: {} event(s)", accountId, events.size());
     m_eventsByAccount[accountId] = std::move(events);
+  } else {
+    const auto it = m_eventsByAccount.find(accountId);
+    kLog.warn(
+        "calendar account {} refresh failed; keeping {} previously loaded event(s)", accountId,
+        it == m_eventsByAccount.end() ? 0 : it->second.size()
+    );
   }
   if (m_pendingAccounts > 0) {
     --m_pendingAccounts;
@@ -632,10 +639,18 @@ void CalendarService::fetchCalDav(const CalendarConfig::Account& account) {
     return;
   }
 
+  std::shared_ptr<const HttpTlsClientCert> tls;
+  if (!account.clientCertFile.empty() || !account.clientKeyFile.empty()) {
+    auto material = std::make_shared<HttpTlsClientCert>();
+    material->clientCertPath = account.clientCertFile;
+    material->clientKeyPath = account.clientKeyFile;
+    tls = std::move(material);
+  }
+
   lookupCalDavPassword(
       account,
-      [this, account, serverUrl,
-       username](security::SecretStoreStatus status, calendar::CalendarCredentialStore::Secret password) mutable {
+      [this, account, serverUrl, username,
+       tls](security::SecretStoreStatus status, const calendar::CalendarCredentialStore::Secret& password) mutable {
         if (status != security::SecretStoreStatus::Success || !password || password->empty()) {
           if (status == security::SecretStoreStatus::NotFound) {
             kLog.warn("caldav account {} has no stored password", account.id);
@@ -651,8 +666,8 @@ void CalendarService::fetchCalDav(const CalendarConfig::Account& account) {
         const bool allowRedirectAuth = account.provider == "icloud";
 
         calendar::discoverCalDavCollections(
-            m_httpClient, serverUrl, username, password, allowRedirectAuth,
-            [this, accountId, username, password, accountColor, selectedCalendars, allowRedirectAuth,
+            m_httpClient, serverUrl, username, password, allowRedirectAuth, tls,
+            [this, accountId, username, password, accountColor, selectedCalendars, allowRedirectAuth, tls,
              now](bool discovered, std::vector<calendar::CalDavCollection> collections) {
               if (!discovered) {
                 accountDone(accountId, false, {});
@@ -696,16 +711,19 @@ void CalendarService::fetchCalDav(const CalendarConfig::Account& account) {
                 caldav.password = password;
                 caldav.calendarName = collection.name;
                 caldav.color = accountColor.empty() ? collection.color : accountColor;
+                caldav.tls = tls;
 
                 m_caldav.fetchEvents(
                     caldav, now - kWindowBefore, now + kWindowAfter, allowRedirectAuth,
-                    [ctx](bool ok, std::vector<CalendarEvent> events) {
+                    [ctx, calendarName = collection.name](bool ok, std::vector<CalendarEvent> events) {
                       if (ok) {
                         ctx->anyOk = true;
                         ctx->events.insert(
                             ctx->events.end(), std::make_move_iterator(events.begin()),
                             std::make_move_iterator(events.end())
                         );
+                      } else {
+                        kLog.warn("caldav account {}: calendar '{}' failed to load", ctx->accountId, calendarName);
                       }
                       if (ctx->pending > 0) {
                         --ctx->pending;
@@ -905,8 +923,8 @@ void CalendarService::fetchVdir(const CalendarConfig::Account& account) {
       .windowStart = windowStart,
       .windowEnd = windowEnd,
       .callback = [this, accountId](
-                      bool ok, std::vector<CalendarSource> sources, std::vector<std::filesystem::path> watchedPaths,
-                      std::vector<CalendarEvent> events
+                      bool ok, const std::vector<CalendarSource>& sources,
+                      std::vector<std::filesystem::path> watchedPaths, std::vector<CalendarEvent> events
                   ) {
         if (ok) {
           (void)m_configService.setStateString(
@@ -928,7 +946,7 @@ void CalendarService::refreshGoogleToken(const std::string& accountId, std::func
   m_credentials.lookupRefreshToken(
       accountId,
       [this, accountId, cb = std::move(cb)](
-          security::SecretStoreStatus status, calendar::CalendarCredentialStore::Secret storedRefreshToken
+          security::SecretStoreStatus status, const calendar::CalendarCredentialStore::Secret& storedRefreshToken
       ) mutable {
         if (status == security::SecretStoreStatus::DeniedOrLocked) {
           if (!m_googleCredentialLockedNotificationShown) {
@@ -1008,7 +1026,7 @@ void CalendarService::googleFetchWithToken(
       accessToken, now - kWindowBefore, now + kWindowAfter,
       [this, accountId, allowRefreshRetry](bool ok, bool unauthorized, std::vector<CalendarEvent> events) {
         if (unauthorized && allowRefreshRetry) {
-          refreshGoogleToken(accountId, [this, accountId](bool refreshed, std::string newToken) {
+          refreshGoogleToken(accountId, [this, accountId](bool refreshed, const std::string& newToken) {
             if (!refreshed) {
               accountDone(accountId, false, {});
             } else {
@@ -1031,7 +1049,7 @@ void CalendarService::fetchGoogle(const CalendarConfig::Account& account) {
   if (valid) {
     googleFetchWithToken(id, session->second.accessToken, true);
   } else {
-    refreshGoogleToken(id, [this, id](bool ok, std::string token) {
+    refreshGoogleToken(id, [this, id](bool ok, const std::string& token) {
       if (!ok) {
         accountDone(id, false, {});
       } else {
@@ -1118,7 +1136,7 @@ void CalendarService::saveCalDavAccount(
     m_credentials.lookupPassword(
         accountId,
         [persistConfig = std::move(persistConfig), callback = std::move(callback)](
-            security::SecretStoreStatus status, calendar::CalendarCredentialStore::Secret passwordValue
+            security::SecretStoreStatus status, const calendar::CalendarCredentialStore::Secret& passwordValue
         ) mutable {
           if (status != security::SecretStoreStatus::Success || !passwordValue || passwordValue->empty()) {
             callback(
